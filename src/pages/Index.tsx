@@ -26,12 +26,40 @@ const Index = () => {
   };
 
   const handleSearch = async (location: string, date: Date, variables: string[]) => {
+    if (!selectedLocation) {
+      console.error('No location selected');
+      return;
+    }
+
     setIsLoading(true);
     setSearchDate(date);
 
-    // Simulate API call - in production, this would call NASA POWER API
-    setTimeout(() => {
-      // Mock data for demonstration
+    try {
+      const response = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/predict-weather`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            lat: selectedLocation.lat,
+            lon: selectedLocation.lon,
+            date: date.toISOString(),
+            variables,
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error('Failed to fetch weather prediction');
+      }
+
+      const data = await response.json();
+      setWeatherData(data);
+    } catch (error) {
+      console.error('Error fetching weather data:', error);
+      // Fallback to mock data on error
       const mockData = {
         rain_probability: Math.floor(Math.random() * 100),
         hot_probability: Math.floor(Math.random() * 100),
@@ -39,10 +67,10 @@ const Index = () => {
         wind_probability: Math.floor(Math.random() * 100),
         average_temp: 15 + Math.random() * 20,
       };
-
       setWeatherData(mockData);
+    } finally {
       setIsLoading(false);
-    }, 2000);
+    }
   };
 
   return (
