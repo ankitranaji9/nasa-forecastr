@@ -1,9 +1,12 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Dict, Optional
 import requests
 from datetime import datetime
+import statistics
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = FastAPI(title="Weather Prediction API")
 
@@ -24,11 +27,19 @@ class WeatherRequest(BaseModel):
 
 class WeatherResponse(BaseModel):
     average_temp: float
+    temp_std_dev: float
+    temp_confidence_range: Dict[str, float]
+    temp_trend: str
+    temp_trend_value: float
+    average_precip: float
+    precip_std_dev: float
     rain_probability: int
     hot_probability: int
     cold_probability: int
     wind_probability: int
     data_years: int
+    data_points: int
+    regional_coverage: str
 
 @app.get("/")
 async def root():
@@ -39,10 +50,53 @@ async def root():
         }
     }
 
+def calculate_trend(values: List[float]) -> float:
+    """Calculate linear regression slope for trend analysis."""
+    if len(values) < 2:
+        return 0.0
+    
+    n = len(values)
+    indices = list(range(n))
+    mean_x = sum(indices) / n
+    mean_y = sum(values) / n
+    
+    numerator = sum((indices[i] - mean_x) * (values[i] - mean_y) for i in range(n))
+    denominator = sum((indices[i] - mean_x) ** 2 for i in range(n))
+    
+    return numerator / denominator if denominator != 0 else 0.0
+
+
+def fetch_location_data(lat: float, lon: float, start_date: str, end_date: str, parameters: str) -> dict:
+    """Fetch NASA POWER data for a specific location."""
+    nasa_url = (
+        f"https://power.larc.nasa.gov/api/temporal/daily/point"
+        f"?parameters={parameters}"
+        f"&community=AG"
+        f"&longitude={lon}"
+        f"&latitude={lat}"
+        f"&start={start_date}"
+        f"&end={end_date}"
+        f"&format=JSON"
+    )
+    
+    response = requests.get(nasa_url, timeout=30)
+    
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"NASA API error: {response.status_code}"
+        )
+    
+    return response.json()
+
+
 @app.post("/predict_weather", response_model=WeatherResponse)
 async def predict_weather(request: WeatherRequest):
     """
-    Predict weather probabilities using NASA POWER API historical data.
+    Predict weather probabilities using NASA POWER API historical data with regional analysis.
+    
+    Fetches data from 5 grid points (~50km radius) for robust regional predictions.
+    Includes advanced statistics: standard deviation, confidence intervals, and trend analysis.
     
     Args:
         lat: Latitude of the location
@@ -51,10 +105,10 @@ async def predict_weather(request: WeatherRequest):
         variables: List of variables to analyze (temperature, rainfall, windspeed)
     
     Returns:
-        Weather probabilities and average temperature
+        Regional weather probabilities with statistical analysis
     """
     try:
-        print(f"Predicting weather for: lat={request.lat}, lon={request.lon}, date={request.date}")
+        print(f"Predicting weather for region around: lat={request.lat}, lon={request.lon}, date={request.date}")
         
         # Parse the target date
         target_date = datetime.fromisoformat(request.date.replace('Z', '+00:00'))
@@ -71,74 +125,107 @@ async def predict_weather(request: WeatherRequest):
         end_date = f"{end_year}{month:02d}{day:02d}"
         
         # NASA POWER API parameters
-        # T2M: Temperature at 2 Meters
-        # PRECTOTCORR: Precipitation Corrected
-        # WS10M: Wind Speed at 10 Meters
         parameters = 'T2M,PRECTOTCORR,WS10M'
         
-        nasa_url = (
-            f"https://power.larc.nasa.gov/api/temporal/daily/point"
-            f"?parameters={parameters}"
-            f"&community=AG"
-            f"&longitude={request.lon}"
-            f"&latitude={request.lat}"
-            f"&start={start_date}"
-            f"&end={end_date}"
-            f"&format=JSON"
-        )
+        # Define regional grid points (0.5° in each direction for ~50km radius)
+        grid_points = [
+            {"lat": request.lat, "lon": request.lon},  # Center
+            {"lat": request.lat + 0.5, "lon": request.lon},  # North
+            {"lat": request.lat - 0.5, "lon": request.lon},  # South
+            {"lat": request.lat, "lon": request.lon + 0.5},  # East
+            {"lat": request.lat, "lon": request.lon - 0.5},  # West
+        ]
         
-        print(f"Fetching NASA data from: {nasa_url}")
+        print(f"Fetching regional NASA data from {len(grid_points)} grid points")
         
-        nasa_response = requests.get(nasa_url, timeout=30)
+        # Fetch data for all grid points in parallel
+        regional_data = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_point = {
+                executor.submit(fetch_location_data, point["lat"], point["lon"], start_date, end_date, parameters): point
+                for point in grid_points
+            }
+            
+            for future in as_completed(future_to_point):
+                try:
+                    data = future.result()
+                    regional_data.append(data)
+                except Exception as e:
+                    print(f"Error fetching data for point: {e}")
         
-        if nasa_response.status_code != 200:
-            raise HTTPException(
-                status_code=nasa_response.status_code,
-                detail=f"NASA API error: {nasa_response.status_code}"
-            )
+        print(f"Regional NASA data received from {len(regional_data)} points")
         
-        nasa_data = nasa_response.json()
-        print("NASA data received")
+        # Aggregate data from all grid points
+        all_temp_values = []
+        all_precip_values = []
+        all_wind_values = []
         
-        # Extract daily data
-        temps = nasa_data.get('properties', {}).get('parameter', {}).get('T2M', {})
-        precip = nasa_data.get('properties', {}).get('parameter', {}).get('PRECTOTCORR', {})
-        wind_speed = nasa_data.get('properties', {}).get('parameter', {}).get('WS10M', {})
+        for nasa_data in regional_data:
+            temps = nasa_data.get('properties', {}).get('parameter', {}).get('T2M', {})
+            precip = nasa_data.get('properties', {}).get('parameter', {}).get('PRECTOTCORR', {})
+            wind_speed = nasa_data.get('properties', {}).get('parameter', {}).get('WS10M', {})
+            
+            all_temp_values.extend([v for v in temps.values() if v != -999])
+            all_precip_values.extend([v for v in precip.values() if v != -999])
+            all_wind_values.extend([v for v in wind_speed.values() if v != -999])
         
-        # Convert to lists for analysis, filtering out -999 (missing data)
-        temp_values = [v for v in temps.values() if v != -999]
-        precip_values = [v for v in precip.values() if v != -999]
-        wind_values = [v for v in wind_speed.values() if v != -999]
+        # Calculate temperature statistics
+        average_temp = statistics.mean(all_temp_values) if all_temp_values else 20
+        temp_std_dev = statistics.stdev(all_temp_values) if len(all_temp_values) > 1 else 0
+        temp_trend_value = calculate_trend(all_temp_values)
         
-        # Calculate average temperature
-        average_temp = sum(temp_values) / len(temp_values) if temp_values else 20
+        # Determine trend interpretation
+        if temp_trend_value > 0.01:
+            temp_trend = "warming"
+        elif temp_trend_value < -0.01:
+            temp_trend = "cooling"
+        else:
+            temp_trend = "stable"
         
-        # Calculate rain probability (days with >1mm precipitation)
-        rainy_days = sum(1 for p in precip_values if p > 1.0)
-        rain_probability = round((rainy_days / len(precip_values)) * 100) if precip_values else 0
+        # Calculate 95% confidence interval for temperature
+        z_score = 1.96  # 95% confidence
+        margin_of_error = z_score * (temp_std_dev / math.sqrt(len(all_temp_values))) if all_temp_values else 0
+        temp_confidence_lower = average_temp - margin_of_error
+        temp_confidence_upper = average_temp + margin_of_error
         
-        # Calculate hot probability (temp > 35°C)
-        hot_days = sum(1 for t in temp_values if t > 35)
-        hot_probability = round((hot_days / len(temp_values)) * 100) if temp_values else 0
+        # Calculate precipitation statistics
+        average_precip = statistics.mean(all_precip_values) if all_precip_values else 0
+        precip_std_dev = statistics.stdev(all_precip_values) if len(all_precip_values) > 1 else 0
         
-        # Calculate cold probability (temp < 10°C)
-        cold_days = sum(1 for t in temp_values if t < 10)
-        cold_probability = round((cold_days / len(temp_values)) * 100) if temp_values else 0
+        # Calculate probabilities
+        rainy_days = sum(1 for p in all_precip_values if p > 1.0)
+        rain_probability = round((rainy_days / len(all_precip_values)) * 100) if all_precip_values else 0
         
-        # Calculate wind probability (wind speed > 10 m/s)
-        windy_days = sum(1 for w in wind_values if w > 10)
-        wind_probability = round((windy_days / len(wind_values)) * 100) if wind_values else 0
+        hot_days = sum(1 for t in all_temp_values if t > 35)
+        hot_probability = round((hot_days / len(all_temp_values)) * 100) if all_temp_values else 0
+        
+        cold_days = sum(1 for t in all_temp_values if t < 10)
+        cold_probability = round((cold_days / len(all_temp_values)) * 100) if all_temp_values else 0
+        
+        windy_days = sum(1 for w in all_wind_values if w > 10)
+        wind_probability = round((windy_days / len(all_wind_values)) * 100) if all_wind_values else 0
         
         result = {
             "average_temp": round(average_temp * 10) / 10,
+            "temp_std_dev": round(temp_std_dev * 10) / 10,
+            "temp_confidence_range": {
+                "lower": round(temp_confidence_lower * 10) / 10,
+                "upper": round(temp_confidence_upper * 10) / 10,
+            },
+            "temp_trend": temp_trend,
+            "temp_trend_value": round(temp_trend_value * 1000) / 1000,
+            "average_precip": round(average_precip * 100) / 100,
+            "precip_std_dev": round(precip_std_dev * 100) / 100,
             "rain_probability": rain_probability,
             "hot_probability": hot_probability,
             "cold_probability": cold_probability,
             "wind_probability": wind_probability,
-            "data_years": len(temp_values),
+            "data_years": 15,
+            "data_points": len(all_temp_values),
+            "regional_coverage": f"~50km radius ({len(grid_points)} grid points)",
         }
         
-        print(f"Prediction result: {result}")
+        print(f"Regional prediction result: {result}")
         
         return result
         
